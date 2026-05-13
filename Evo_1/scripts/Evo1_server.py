@@ -61,18 +61,41 @@ class Normalizer:
 
 
 def load_model_and_normalizer(ckpt_dir):
-    config = json.load(open(os.path.join(ckpt_dir, "config.json")))
-    stats = json.load(open(os.path.join(ckpt_dir, "norm_stats.json")))
+    meta_path = os.path.join(ckpt_dir, "checkpoint.json")
+    metadata = {}
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            metadata = json.load(f)
+
+    config_file = metadata.get("config_file", "config.json")
+    norm_stats_file = metadata.get("norm_stats_file", "norm_stats.json")
+    model_state_file = metadata.get("model_state_file", metadata.get("checkpoints", "mp_rank_00_model_states.pt"))
+    state_dict_key = metadata.get("state_dict_key", "module")
+
+    config_path = os.path.join(ckpt_dir, config_file)
+    stats_path = os.path.join(ckpt_dir, norm_stats_file)
+    ckpt_path = os.path.join(ckpt_dir, model_state_file)
+
+    config = json.load(open(config_path))
+    stats = json.load(open(stats_path))
 
     config["finetune_vlm"] = False
     config["finetune_action_head"] = False
     config["num_inference_timesteps"] = 32
 
     model = EVO1(config).eval()
-    ckpt_path = os.path.join(ckpt_dir, "mp_rank_00_model_states.pt")
 
     checkpoint = torch.load(ckpt_path, map_location="cpu")
-    model.load_state_dict(checkpoint["module"], strict=True)
+    state_dict = checkpoint[state_dict_key] if state_dict_key in checkpoint else checkpoint
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Failed to load checkpoint strictly from {ckpt_path} using config {config_path}. "
+            f"action_head={config.get('action_head')}, horizon={config.get('horizon')}, "
+            f"per_action_dim={config.get('per_action_dim')}, block_size_a={config.get('block_size_a')}, "
+            f"block_size_c={config.get('block_size_c')}, topk={config.get('topk')}. Original error: {e}"
+        ) from e
     model = model.to("cuda")
 
     normalizer = Normalizer(stats)
@@ -146,7 +169,8 @@ async def handle_request(websocket, model, normalizer):
 
 # === 启动服务 ===
 if __name__ == "__main__":
-    ckpt_dir = "Your/Path/To/Checkpoint"
+    # ckpt_dir = "/home/kataz/project/Evo-1/Evo1_ckpt/MetaWorld"
+    ckpt_dir = "/home/kataz/project/Evo-1/tmp_blockbottleneck/step_final"
     #Example: ckpt_dir = "/home/dell/checkpoints/Evo1/Evo1_MetaWorld/"
 
     port = 9000

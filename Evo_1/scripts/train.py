@@ -213,9 +213,45 @@ def log_training_step(step, loss, total_norm, clipped_norm, scheduler, dataloade
     
         })
 
+def _read_checkpoint_metadata(checkpoint_dir: str):
+    checkpoint_meta_path = os.path.join(checkpoint_dir, "checkpoint.json")
+    if not os.path.exists(checkpoint_meta_path):
+        return {}
+    with open(checkpoint_meta_path, "r") as f:
+        return json.load(f)
+
+
+def _get_effective_config(model_engine, accelerator, fallback_config=None):
+    unwrapped_model = accelerator.unwrap_model(model_engine)
+    model_config = getattr(unwrapped_model, "config", None)
+    if isinstance(model_config, dict):
+        return dict(model_config)
+    return dict(fallback_config or {})
+
+
+def _build_checkpoint_metadata(backend: str, step, model_state_file: str = "mp_rank_00_model_states.pt"):
+    metadata = {
+        "format": "evo1_v1",
+        "backend": backend,
+        "model_state_file": model_state_file,
+        "state_dict_key": "module",
+        "step": step,
+        "tag": f"step_{step}",
+        "config_file": "config.json",
+        "norm_stats_file": "norm_stats.json",
+        "config_role": "model_config",
+        "checkpoints": model_state_file,
+        "version": 0.0,
+    }
+    metadata["type"] = "ds_model" if backend == "deepspeed" else "evo1_model"
+    return metadata
+
+
 def save_checkpoint(save_dir, step, model_engine, loss, accelerator, config=None, norm_stats=None):
     tag = f"step_{step}"
     checkpoint_dir = os.path.join(save_dir, tag)
+    model_state_file = "mp_rank_00_model_states.pt"
+    effective_config = _get_effective_config(model_engine, accelerator, config)
 
     if accelerator.is_main_process and os.path.exists(checkpoint_dir):
         logging.warning(f"Checkpoint directory {checkpoint_dir} exists. Removing before overwrite.")
@@ -223,69 +259,104 @@ def save_checkpoint(save_dir, step, model_engine, loss, accelerator, config=None
 
     accelerator.wait_for_everyone()
 
+    if accelerator.is_main_process:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
     client_state = {
         "step": step,
         "best_loss": loss if isinstance(loss, float) else loss.item(),
-        "config": config,
-    } if accelerator.is_main_process else {} 
+        "config": effective_config,
+    } if accelerator.is_main_process else {}
 
-    model_engine.save_checkpoint(save_dir, tag=tag, client_state=client_state)
-    
+    if hasattr(model_engine, "save_checkpoint"):
+        backend = "deepspeed"
+        model_engine.save_checkpoint(save_dir, tag=tag, client_state=client_state)
+    else:
+        backend = "accelerate"
+        if accelerator.is_main_process:
+            state_dict = accelerator.get_state_dict(model_engine)
+            accelerator.save(
+                {"module": state_dict, "client_state": client_state},
+                os.path.join(checkpoint_dir, model_state_file),
+            )
+    accelerator.wait_for_everyone()
+
     if accelerator.is_main_process:
-        if config is not None:
-            config_path = os.path.join(checkpoint_dir, "config.json")
-            with open(config_path, "w") as f:
-                json.dump(config, f, indent=2)
+        config_path = os.path.join(checkpoint_dir, "config.json")
+        with open(config_path, "w") as f:
+            json.dump(effective_config, f, indent=2)
 
         if norm_stats is not None:
             norm_stats_path = os.path.join(checkpoint_dir, "norm_stats.json")
             with open(norm_stats_path, "w") as f:
                 json.dump(norm_stats, f, indent=2)
-                
+
         checkpoint_meta_path = os.path.join(checkpoint_dir, "checkpoint.json")
-        checkpoint_meta = {
-            "type": "ds_model",
-            "version": 0.0,
-            "checkpoints": "mp_rank_00_model_states.pt"
-        }
+        checkpoint_meta = _build_checkpoint_metadata(backend, step, model_state_file=model_state_file)
         with open(checkpoint_meta_path, "w") as f:
             json.dump(checkpoint_meta, f, indent=2)
-        logging.info(f"[Rank {accelerator.process_index}] Saved checkpoint to {checkpoint_dir}")
+        logging.info(f"[Rank {accelerator.process_index}] Saved checkpoint to {checkpoint_dir} using {backend}")
+
 
 def load_checkpoint_with_deepspeed(model_engine, load_dir, accelerator, tag="step_best", load_optimizer_states=True, resume_pretrain=False):
+    checkpoint_dir = os.path.join(load_dir, tag)
+    metadata = _read_checkpoint_metadata(checkpoint_dir)
+    backend = metadata.get("backend")
+    if backend is None and metadata.get("type") == "ds_model":
+        backend = "deepspeed"
+    model_state_file = metadata.get("model_state_file", metadata.get("checkpoints", "mp_rank_00_model_states.pt"))
+    state_dict_key = metadata.get("state_dict_key", "module")
+    has_deepspeed_api = hasattr(model_engine, "load_checkpoint")
 
-    try:
-        load_path, client_state = model_engine.load_checkpoint(
-            load_dir,
-            tag=tag,
-            load_module_strict=True,
-            load_optimizer_states=load_optimizer_states and not resume_pretrain,
-            load_lr_scheduler_states=load_optimizer_states and not resume_pretrain
-        )
+    if backend == "accelerate":
+        checkpoint = torch.load(os.path.join(checkpoint_dir, model_state_file), map_location="cpu")
+        state_dict = checkpoint[state_dict_key] if state_dict_key in checkpoint else checkpoint
+        accelerator.unwrap_model(model_engine).load_state_dict(state_dict, strict=True)
+        client_state = checkpoint.get("client_state", {})
         if accelerator.is_main_process:
-            logging.info(f"Loaded DeepSpeed checkpoint from {load_dir}/{tag} (including optimizer states)")
+            logging.info(f"Loaded checkpoint from {checkpoint_dir} (model weights only)")
         return client_state.get("step", 0), client_state
-        
-    except Exception as e:
-        if accelerator.is_main_process:
-            logging.warning(f"World size mismatch detected: {str(e)}")
-            logging.warning("Attempting to load only model weights (skipping optimizer states)...")
+
+    if has_deepspeed_api:
         try:
             load_path, client_state = model_engine.load_checkpoint(
                 load_dir,
                 tag=tag,
                 load_module_strict=True,
-                load_optimizer_states=False,
-                load_lr_scheduler_states=False
+                load_optimizer_states=load_optimizer_states and not resume_pretrain,
+                load_lr_scheduler_states=load_optimizer_states and not resume_pretrain
             )
             if accelerator.is_main_process:
-                logging.info(f"Loaded DeepSpeed checkpoint from {load_dir}/{tag} (model weights only)")
+                logging.info(f"Loaded DeepSpeed checkpoint from {load_dir}/{tag} (including optimizer states)")
             return client_state.get("step", 0), client_state
-            
-        except Exception as e2:
+
+        except Exception as e:
             if accelerator.is_main_process:
-                logging.error(f"Failed to load checkpoint even without optimizer states: {str(e2)}")
-            raise RuntimeError(f"Failed to load DeepSpeed checkpoint from {load_dir} with tag {tag}: {str(e2)}")
+                logging.warning(f"World size mismatch detected: {str(e)}")
+                logging.warning("Attempting to load only model weights (skipping optimizer states)...")
+            try:
+                load_path, client_state = model_engine.load_checkpoint(
+                    load_dir,
+                    tag=tag,
+                    load_module_strict=True,
+                    load_optimizer_states=False,
+                    load_lr_scheduler_states=False
+                )
+                if accelerator.is_main_process:
+                    logging.info(f"Loaded DeepSpeed checkpoint from {load_dir}/{tag} (model weights only)")
+                return client_state.get("step", 0), client_state
+
+            except Exception as e2:
+                if accelerator.is_main_process:
+                    logging.warning(f"DeepSpeed load failed, falling back to single-file weights: {str(e2)}")
+
+    checkpoint = torch.load(os.path.join(checkpoint_dir, model_state_file), map_location="cpu")
+    state_dict = checkpoint[state_dict_key] if state_dict_key in checkpoint else checkpoint
+    accelerator.unwrap_model(model_engine).load_state_dict(state_dict, strict=True)
+    client_state = checkpoint.get("client_state", {})
+    if accelerator.is_main_process:
+        logging.info(f"Loaded checkpoint from {checkpoint_dir} (model weights only)")
+    return client_state.get("step", 0), client_state
 
     
 
@@ -541,7 +612,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--run_name", type=str, default="default_run")
     parser.add_argument("--vlm_name", type=str, default="OpenGVLab/InternVL3-1B")
-    parser.add_argument("--action_head", type=str, default="flowmatching", choices=["flowmatching"])
+    parser.add_argument("--action_head", type=str, default="flowmatching", choices=["flowmatching", "blockbottleneck"])
     parser.add_argument("--return_cls_only", action="store_true")
     parser.add_argument("--disable_wandb", action="store_true", help="Disable wandb logging.")
 
@@ -583,6 +654,9 @@ if __name__ == "__main__":
     parser.add_argument("--horizon", type=int, default=16)
     parser.add_argument("--num_layers", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--block_size_a", type=int, default=5)
+    parser.add_argument("--block_size_c", type=int, default=32)
+    parser.add_argument("--topk", type=int, default=4)
     # dropout
     parser.add_argument("--dropout", type=float, default=0.0)
 
