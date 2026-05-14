@@ -44,34 +44,113 @@
 
 ## ⚙️ Installation
 
-Prepare the environment for Evo-1
+### Environment overview
+
+This repo commonly uses three Conda environments:
+
+- `Evo1`: main training and inference environment
+- `metaworld`: Meta-World evaluation client environment
+- `libero`: LIBERO evaluation environment
+
+Set them up in this order:
+
+1. Prepare Linux / WSL2 and system packages
+2. Install Miniconda
+3. Create `Evo1`
+4. Create `metaworld`
+5. Create `libero`
+
+### 1️⃣ Prepare Linux / WSL2
+
+If you are using Windows, install **WSL2 + Ubuntu** first, then do the rest inside Ubuntu.
 
 ```bash
-# Clone this repo
-git clone https://github.com/MINT-SJTU/Evo-1.git
-
-cd Evo-1/
-
-# Create a Conda environment
-conda create -n Evo1 python=3.10 -y
-
-conda activate Evo1
-
-# Install requirements
-cd Evo_1
-
-pip install -r requirements.txt
-
-# You may need to reduce MAX_JOBS to suit your computer
-# (!!! This is a critical step — skipping it may cause lower success rate or unstable robot motion !!!)
-MAX_JOBS=64 pip install -v flash-attn --no-build-isolation
+# Windows PowerShell (Admin), optional for Windows users only
+wsl --install -d Ubuntu
+wsl -l -v
 ```
 
-##  Simulation Benchmark
+Inside Linux / Ubuntu, install the base system packages first:
+
+```bash
+nvidia-smi
+sudo apt update
+sudo apt upgrade -y
+sudo apt install -y git git-lfs build-essential wget curl vim
+
+git lfs install
+```
+
+### 2️⃣ Install Miniconda
+
+```bash
+cd ~
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh
+source ~/.bashrc
+conda --version
+```
+
+### 3️⃣ Clone the repo and pull LFS assets
+
+```bash
+git clone https://github.com/MINT-SJTU/Evo-1.git
+cd Evo-1
+git lfs pull
+```
+
+This repo can include large binary assets such as the prebuilt FlashAttention wheel. Run `git lfs pull` after cloning so those files are available locally.
+
+### 4️⃣ Create the main Evo1 environment
+
+The validated setup in `Coding.pdf` uses **Python 3.10**, **PyTorch 2.5.1**, and **CUDA 12.1**.
+
+```bash
+conda create -n Evo1 python=3.10 -y
+conda activate Evo1
+
+pip install "setuptools<82"
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
+
+cd Evo_1
+pip install -r requirements.txt
+pip install -U "huggingface_hub[cli]"
+```
+
+### 5️⃣ Install FlashAttention
+
+`flash-attn` is the most fragile dependency in practice. Building it from source can require a lot of RAM, so the recommended path is to install a **prebuilt wheel** that matches your Python / CUDA / PyTorch versions.
+
+This repository includes a validated prebuilt wheel for the `Evo1` environment:
+
+- `flash_attn-2.8.0+cu121torch2.5-cp310-cp310-linux_x86_64.whl`
+
+After cloning the repo and running `git lfs pull`, install it from the repository root:
+
+```bash
+cd /home/kataz/project/Evo-1
+conda activate Evo1
+python -m pip install ./flash_attn-2.8.0+cu121torch2.5-cp310-cp310-linux_x86_64.whl
+```
+
+If you have enough RAM and a matching CUDA toolchain, you can still try a source install, but the prebuilt wheel is usually much more reliable on local machines.
+
+### 6️⃣ Hugging Face network notes
+
+Model and dataset download commands use Hugging Face. If your network requires a proxy, export it before running `hf download`, `git clone`, or `git lfs pull`.
+
+```bash
+export HTTP_PROXY=http://your-proxy-host:port
+export HTTPS_PROXY=http://your-proxy-host:port
+```
+
+## Simulation Benchmark
 
 ### 🧪 Meta-World Benchmark
 
-### 1️⃣ Prepare the environment for Meta-World
+#### 1️⃣ Prepare the Meta-World environment
 
 ```bash
 conda create -n metaworld python=3.10 -y
@@ -81,42 +160,36 @@ pip install metaworld
 pip install websockets
 pip install opencv-python
 pip install packaging
-pip install huggingface_hub
+pip install -U "huggingface_hub[cli]"
 ```
 
-### 2️⃣ Model Preparation
-
-### 📥 2.1 Download Model Weight
+#### 2️⃣ Download the Meta-World checkpoint
 
 ```bash
 hf download MINT-SJTU/Evo1_MetaWorld --local-dir /path/to/save/checkpoint/
 ```
 
+#### 3️⃣ Configure the server and client
 
-### ✏️ 2.2 Modify config
+Before running evaluation:
 
-Modify checkpoint dir: [Evo1_server.py#L149](Evo_1/scripts/Evo1_server.py#L149)  
-(Optional) Modify server port: [Evo1_server.py#L152](Evo_1/scripts/Evo1_server.py#L152)  
-(Optional) Modify client port: [mt50_evo1_client_prompt.py#L40](MetaWorld_evaluation/mt50_evo1_client_prompt.py#L40)
+- Edit `Evo_1/scripts/Evo1_server.py` and set `ckpt_dir` to the downloaded checkpoint directory.
+- If needed, change `port` in `Evo_1/scripts/Evo1_server.py`.
+- Edit `MetaWorld_evaluation/mt50_evo1_client_prompt.py` and make sure `SERVER_URL` matches the server host and port.
 
-
-### 3️⃣ Run Meta-World Evaluation
+#### 4️⃣ Run Meta-World evaluation
 
 ```bash
 # Terminal 1
 conda activate Evo1
-
 cd Evo_1
-
 python scripts/Evo1_server.py
 ```
 
 ```bash
 # Terminal 2
 conda activate metaworld
-
 cd MetaWorld_evaluation
-
 python mt50_evo1_client_prompt.py
 ```
 
@@ -124,148 +197,156 @@ python mt50_evo1_client_prompt.py
 
 ### 🧪 LIBERO Benchmark
 
-### 1️⃣ Prepare the environment for LIBERO
+#### 1️⃣ Prepare the LIBERO environment
 
 ```bash
 conda create -n libero python=3.8.13 -y
-
 conda activate libero
 
-cd LIBERO_evaluation/
-
+cd LIBERO_evaluation
 git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
-
 cd LIBERO
 
 pip install -r requirements.txt
-
 pip install torch==1.11.0+cu113 torchvision==0.12.0+cu113 torchaudio==0.11.0 --extra-index-url https://download.pytorch.org/whl/cu113
-
 pip install -e .
-
 pip install websockets
-
-pip install huggingface_hub
+pip install -U "huggingface_hub[cli]"
 ```
 
-### 2️⃣ Model Preparation
-
-### 📥 2.1 Download Model Weight
+#### 2️⃣ Download the LIBERO checkpoint
 
 ```bash
 hf download MINT-SJTU/Evo1_LIBERO --local-dir /path/to/save/checkpoint/
 ```
 
+#### 3️⃣ Configure the server and client
 
+Before running evaluation:
 
-### ✏️ 2.2 Modify config
-Modify checkpoint dir: [Evo1_server.py#L149](Evo_1/scripts/Evo1_server.py#L149)  
-Modify ckpt name: [libero_client_4tasks.py#L24](LIBERO_evaluation/libero_client_4tasks.py#L24)  
-(Optional) Modify server port: [Evo1_server.py#L152](Evo_1/scripts/Evo1_server.py#L152)  
-(Optional) Modify client port: [libero_client_4tasks.py#L23](LIBERO_evaluation/libero_client_4tasks.py#L23)  
+- Edit `Evo_1/scripts/Evo1_server.py` and set `ckpt_dir` to the downloaded checkpoint directory.
+- Edit `LIBERO_evaluation/libero_client_4tasks.py` and set the checkpoint name / path it expects.
+- If needed, change `port` in `Evo_1/scripts/Evo1_server.py`.
+- Make sure the client URL in `LIBERO_evaluation/libero_client_4tasks.py` matches the server host and port.
 
-
-#### 3️⃣ Run LIBERO Evaluation
+#### 4️⃣ Run LIBERO evaluation
 
 ```bash
 # Terminal 1
 conda activate Evo1
-
 cd Evo_1
-
 python scripts/Evo1_server.py
 ```
 
 ```bash
 # Terminal 2
 conda activate libero
-
 cd LIBERO_evaluation
-
 python libero_client_4tasks.py
 ```
 
 ## 🧠 Training on Your Own Dataset
 
-We support **lerobot v2.1** format, please convert your data to this format.
+We support **LeRobot v2.1** format. Please convert your own dataset to this format before training.
 
-We use MetaWorld Dataset here as an example.
+We use the MetaWorld dataset as the example below.
 
-### 📥 1. Download Dataset
+### 1️⃣ What to prepare before downloading the dataset
+
+Before downloading datasets, make sure all of the following are ready:
+
+- Linux / WSL2 environment is working normally.
+- `git-lfs` is installed and initialized.
+- The `Evo1` Conda environment is already created.
+- You have enough disk space for the raw dataset **and** the local cache generated during loading.
+- If you are behind a proxy, export `HTTP_PROXY` and `HTTPS_PROXY` before downloading from Hugging Face.
+
+### 2️⃣ Download the dataset
 
 ```bash
-mkdir Evo1_training_dataset/
-
-cd Evo1_training_dataset/
+cd /home/kataz/project/Evo-1
+mkdir -p Evo1_training_dataset
+cd Evo1_training_dataset
 
 GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/datasets/MINT-SJTU/Evo1_MetaWorld_Dataset
-
-cd Evo1_MetaWorld_Dataset/
-
+cd Evo1_MetaWorld_Dataset
 git lfs pull
 ```
 
-### ✏️ 2 Modify config
+If you want to train on another dataset bundle, keep the same directory pattern and update the config accordingly.
 
-### ✏️ 2.1 Modify config.yaml
+### 3️⃣ Update dataset config before training
 
-You need to modify the [config.yaml](Evo_1/dataset/config.yaml)
+#### 3.1 Update `dataset/config.yaml`
 
-This is used to set the dataset path and the camera mapping.
+Edit `Evo_1/dataset/config.yaml` and set:
 
-### ✏️ 2.2 Set the cache path
+- the real local dataset path
+- the camera / view mapping used by your dataset
 
-You need to change the [cache_dir](Evo_1/dataset/lerobot_dataset_pretrain_mp.py#L174)
+Example:
 
-Set the cache path so the dataset can be loaded from .pkl files next time for faster loading.
-
-### 🚀 3 Start Training
-
-We use the two-stage training paradigm.
-
-### 🚀 3.1 Setup deepspeed
-
-```bash
-accelerate config     
+```yaml
+metaworld_sawyer:
+  Evo1_MetaWorld:
+    path: /home/kataz/project/Evo-1/Evo1_training_dataset/Evo1_MetaWorld_Dataset
+    view_map:
+      image_1: observation.images.image
 ```
-You can check this [setup guide](deepspeed_setup_example.txt)
 
-<br>
+#### 3.2 Update the local cache directory
 
-### 🚀 3.2 Stage 1
+Edit `Evo_1/dataset/lerobot_dataset_pretrain_mp.py` and set the dataset cache path to a directory with enough free disk space.
 
-We only train the integration module and action expert in stage 1.   
+This cache is used to store processed `.pkl` metadata so later runs can load much faster.
 
-If you are training with multiple GPU, set --num_processes to the GPU number.  
-You need to change the --run_name,--save_dir,--resume_path base on your own config.
+### 4️⃣ Configure Accelerate / DeepSpeed
+
+Before training, run:
 
 ```bash
 conda activate Evo1
+cd /home/kataz/project/Evo-1/Evo_1
+accelerate config
+```
 
-cd Evo_1/
+You can refer to `deepspeed_setup_example.txt` when answering the setup questions.
+
+### 5️⃣ Start training
+
+Evo-1 uses a **two-stage training pipeline**.
+
+If you are training on multiple GPUs, set `--num_processes` to the number of GPUs.
+
+#### 5.1 Stage 1
+
+Stage 1 trains the integration module and action expert.
+
+```bash
+conda activate Evo1
+cd /home/kataz/project/Evo-1/Evo_1
 
 accelerate launch --num_processes 1 --num_machines 1 --deepspeed_config_file ds_config.json scripts/train.py --run_name Evo1_metaworld_stage1 --action_head flowmatching --use_augmentation --lr 1e-5 --dropout 0.2 --weight_decay 1e-3 --batch_size 16 --image_size 448 --max_steps 5000 --log_interval 10 --ckpt_interval 2500 --warmup_steps 1000 --grad_clip_norm 1.0 --num_layers 8 --horizon 50 --finetune_action_head --disable_wandb --vlm_name OpenGVLab/InternVL3-1B --dataset_config_path dataset/config.yaml --per_action_dim 24 --state_dim 24 --save_dir /your/path/checkpoints/stage1
 ```
-<br>
 
-### 🚀 3.3 Stage 2
-We perform Full-scale training in stage 2.   
+#### 5.2 Stage 2
+
+Stage 2 performs full-scale training and resumes from the Stage 1 checkpoint.
 
 ```bash
 conda activate Evo1
-
-cd Evo_1/
+cd /home/kataz/project/Evo-1/Evo_1
 
 accelerate launch --num_processes 1 --num_machines 1 --deepspeed_config_file ds_config.json scripts/train.py --run_name Evo1_metaworld_stage2 --action_head flowmatching --use_augmentation --lr 1e-5 --dropout 0.2 --weight_decay 1e-3 --batch_size 16 --image_size 448 --max_steps 80000 --log_interval 10 --ckpt_interval 2500 --warmup_steps 1000 --grad_clip_norm 1.0 --num_layers 8 --horizon 50 --finetune_vlm --finetune_action_head --disable_wandb --vlm_name OpenGVLab/InternVL3-1B --dataset_config_path dataset/config.yaml --per_action_dim 24 --state_dim 24 --save_dir /your/path/checkpoints/stage2 --resume --resume_pretrain --resume_path /your/path/checkpoints/stage1/step_5000
 ```
 
-<br>
-
-### 🚀 3.4 (Optional) Resume
-If you want to resume the training process, you can use the following command (we use stage 2 as an example):
+#### 5.3 Resume training from a saved checkpoint
 
 ```bash
-accelerate launch --num_processes 1 --num_machines 1 --deepspeed_config_file ds_config.json scripts/train.py --run_name Your_own_name --action_head flowmatching --use_augmentation --lr 1e-5 --dropout 0.2 --weight_decay 1e-3 --batch_size 16 --image_size 448 --max_steps 80000 --log_interval 10 --ckpt_interval 2500 --warmup_steps 1000 --grad_clip_norm 1.0 --num_layers 8 --horizon 50 --finetune_vlm --finetune_action_head --disable_wandb --vlm_name OpenGVLab/InternVL3-1B --dataset_config_path dataset/config.yaml --per_action_dim 24 --state_dim 24 --save_dir /your/path/to/save/the/checkpoints/ --resume  --resume_path /the/checkpoint/path/you/want/to/resume/from/step_20000
+conda activate Evo1
+cd /home/kataz/project/Evo-1/Evo_1
+
+accelerate launch --num_processes 1 --num_machines 1 --deepspeed_config_file ds_config.json scripts/train.py --run_name Your_own_name --action_head flowmatching --use_augmentation --lr 1e-5 --dropout 0.2 --weight_decay 1e-3 --batch_size 16 --image_size 448 --max_steps 80000 --log_interval 10 --ckpt_interval 2500 --warmup_steps 1000 --grad_clip_norm 1.0 --num_layers 8 --horizon 50 --finetune_vlm --finetune_action_head --disable_wandb --vlm_name OpenGVLab/InternVL3-1B --dataset_config_path dataset/config.yaml --per_action_dim 24 --state_dim 24 --save_dir /your/path/to/save/the/checkpoints/ --resume --resume_path /the/checkpoint/path/you/want/to/resume/from/step_20000
 ```
 
 
