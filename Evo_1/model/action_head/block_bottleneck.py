@@ -162,7 +162,13 @@ class BlockRoutedCrossAttention(nn.Module):
             x = F.pad(x, (0, 0, 0, pad_len), mode="constant", value=0.0)
         return x, pad_len
     
-    def forward(self, action_tokens: torch.Tensor, context_tokens: torch.Tensor, return_aux: bool = False):
+    def forward(
+        self,
+        action_tokens: torch.Tensor,
+        context_tokens: torch.Tensor,
+        return_aux: bool = False,
+        has_state_token: bool = False,
+    ):
         """
         action_tokens: [B, Ta, Da]
         context_tokens: [B, Tc, Dc]
@@ -175,82 +181,115 @@ class BlockRoutedCrossAttention(nn.Module):
         assert B == B2
         assert Da == self.action_dim
         assert Dc == self.cond_dim
-        assert Tc_total >= 1, "context_tokens 至少需要包含最后一个 state token"
-        normal_context_tokens = context_tokens[:, :-1, :]   # [B, Tc, Dc]
-        state_token = context_tokens[:, -1:, :]             # [B, 1, Dc]
+        assert Tc_total >= 1, "context_tokens must contain at least one context token"
+        if has_state_token:
+            assert Tc_total >= 2, "context_tokens must contain normal context tokens plus one state token"
+            normal_context_tokens = context_tokens[:, :-1, :]
+            state_token = context_tokens[:, -1:, :]
+        else:
+            normal_context_tokens = context_tokens
+            state_token = None
         Tc = normal_context_tokens.size(1)
-        # 1) pad
-        action_pad, pad_a = self._pad_to_block(action_tokens, self.block_size_a)   # [B, Ta_pad, Da]
-        context_pad, pad_c = self._pad_to_block(normal_context_tokens, self.block_size_c) # [B, Tc_pad, Dc]
+
+        action_pad, pad_a = self._pad_to_block(action_tokens, self.block_size_a)
+        context_pad, pad_c = self._pad_to_block(normal_context_tokens, self.block_size_c)
 
         Ta_pad = action_pad.size(1)
         Tc_pad = context_pad.size(1)
 
         num_a_blocks = Ta_pad // self.block_size_a
         num_c_blocks = Tc_pad // self.block_size_c
+        if num_c_blocks == 0:
+            raise ValueError("BlockRoutedCrossAttention requires at least one normal context block")
         topk_eff = min(self.topk, num_c_blocks)
 
-        # 2) 分块
-        action_blocks = action_pad.view(B, num_a_blocks, self.block_size_a, Da)    # [B, Na, Sa, Da]
-        context_blocks = context_pad.view(B, num_c_blocks, self.block_size_c, Dc)  # [B, Nc, Sc, Dc]
+        action_blocks = action_pad.view(B, num_a_blocks, self.block_size_a, Da)
+        context_blocks = context_pad.view(B, num_c_blocks, self.block_size_c, Dc)
 
-        # 3) 块内 pooling（使用 nn.AdaptiveAvgPool1d）
         action_blocks_for_pool = action_blocks.reshape(
             B * num_a_blocks, self.block_size_a, Da
-        ).transpose(1, 2)  # [B*Na, Da, Sa]
-
+        ).transpose(1, 2)
         action_summary = self.action_block_pool(action_blocks_for_pool).squeeze(-1)
-        action_summary = action_summary.view(B, num_a_blocks, Da)  # [B, Na, Da]
+        action_summary = action_summary.view(B, num_a_blocks, Da)
 
-        context_blocks_for_pool = context_blocks.reshape(
-            B * num_c_blocks, self.block_size_c, Dc
-        ).transpose(1, 2)  # [B*Nc, Dc, Sc]
+        context_valid = torch.ones(B, Tc, dtype=torch.bool, device=context_tokens.device)
+        if pad_c > 0:
+            context_valid = F.pad(context_valid, (0, pad_c), mode="constant", value=False)
+        context_token_valid = context_valid.view(B, num_c_blocks, self.block_size_c)
+        context_block_valid = context_token_valid.any(dim=-1)
+        context_token_valid_f = context_token_valid.to(dtype=context_blocks.dtype).unsqueeze(-1)
+        context_summary = (context_blocks * context_token_valid_f).sum(dim=2)
+        context_summary = context_summary / context_token_valid_f.sum(dim=2).clamp_min(1.0)
 
-        context_summary = self.context_block_pool(context_blocks_for_pool).squeeze(-1)
-        context_summary = context_summary.view(B, num_c_blocks, Dc)  # [B, Nc, Dc]
-
-        # 4) 路由分数
-        action_route = self.action_route_proj(action_summary)   # [B, Na, R]
-        context_route = self.cond_route_proj(context_summary)   # [B, Nc, R]
+        action_route = self.action_route_proj(action_summary)
+        context_route = self.cond_route_proj(context_summary)
 
         routing_scores = torch.matmul(action_route, context_route.transpose(-1, -2))
         if self.use_scale:
             routing_scores = routing_scores / math.sqrt(self.route_dim)
+        routing_scores_masked = routing_scores.masked_fill(
+            ~context_block_valid.unsqueeze(1), torch.finfo(routing_scores.dtype).min
+        )
 
-        # 5) top-k
-        topk_indices = routing_scores.topk(k=topk_eff, dim=-1).indices  # [B, Na, K]
+        topk_values, topk_indices = routing_scores_masked.topk(k=topk_eff, dim=-1)
+        route_weights = torch.softmax(topk_values, dim=-1)
+        route_log_bias = torch.log_softmax(topk_values, dim=-1)
 
-        # 6) gather 条件块
         context_blocks_flat = context_blocks.reshape(B * num_c_blocks, self.block_size_c, Dc)
+        context_valid_flat = context_token_valid.reshape(B * num_c_blocks, self.block_size_c)
         batch_offsets = torch.arange(B, device=context_tokens.device).view(B, 1, 1) * num_c_blocks
         flat_indices = topk_indices + batch_offsets
-        # 通过展平取索引的方式来得到各个block
-        selected_context_blocks = context_blocks_flat[flat_indices]  # [B, Na, K, Sc, Dc]
+        selected_context_blocks = context_blocks_flat[flat_indices]
+        selected_context_valid = context_valid_flat[flat_indices]
+
+        selected_context_blocks = selected_context_blocks * route_weights[..., None, None]
         selected_context_tokens = selected_context_blocks.reshape(
             B, num_a_blocks, topk_eff * self.block_size_c, Dc
-        )  # [B, Na, K*Sc, Dc]
-        
-        # 8) 单独拼接state_token，再与action做cross-attention
-        state_token_expand = state_token.unsqueeze(1).expand(B, num_a_blocks, 1, Dc)  # [B, Na, 1, Dc]
-        selected_context_tokens = torch.cat(
-            [selected_context_tokens, state_token_expand], dim=2
-        )  # [B, Na, K*Sc+1, Dc]
-        # 7) 向量化共享 cross-attn
+        )
+        selected_token_valid = selected_context_valid.reshape(
+            B, num_a_blocks, topk_eff * self.block_size_c
+        )
+
+        if state_token is not None:
+            state_token_expand = state_token.unsqueeze(1).expand(B, num_a_blocks, 1, Dc)
+            selected_context_tokens = torch.cat(
+                [selected_context_tokens, state_token_expand], dim=2
+            )
+            state_valid = torch.ones(B, num_a_blocks, 1, dtype=torch.bool, device=context_tokens.device)
+            selected_token_valid = torch.cat([selected_token_valid, state_valid], dim=2)
+
         action_blocks_flat = action_blocks.reshape(B * num_a_blocks, self.block_size_a, Da)
         selected_context_flat = selected_context_tokens.reshape(
             B * num_a_blocks, selected_context_tokens.size(2), Dc
         )
-        # By my is "for" but AI choose matrix
+        key_padding_mask = selected_context_flat.new_zeros(B * num_a_blocks, selected_context_flat.size(1))
+        key_padding_mask = key_padding_mask.masked_fill(
+            ~selected_token_valid.reshape(B * num_a_blocks, -1), torch.finfo(key_padding_mask.dtype).min
+        )
+
+        normal_bias = route_log_bias[..., None].expand(
+            B, num_a_blocks, topk_eff, self.block_size_c
+        ).reshape(B, num_a_blocks, topk_eff * self.block_size_c)
+        if state_token is not None:
+            state_bias = torch.zeros(B, num_a_blocks, 1, dtype=normal_bias.dtype, device=normal_bias.device)
+            attn_bias = torch.cat([normal_bias, state_bias], dim=-1)
+        else:
+            attn_bias = normal_bias
+        attn_bias = attn_bias.unsqueeze(2).expand(
+            B, num_a_blocks, self.block_size_a, attn_bias.size(-1)
+        ).reshape(B * num_a_blocks, self.block_size_a, -1)
+        attn_bias = attn_bias.repeat_interleave(self.num_heads, dim=0)
+
         attn_out, _ = self.cross_attn(
             query=action_blocks_flat,
             key=selected_context_flat,
             value=selected_context_flat,
+            attn_mask=attn_bias,
+            key_padding_mask=key_padding_mask,
             need_weights=False,
         )
 
         attn_out = self.out_dropout(attn_out)
-
-        # 8) 拼回原序列
         attn_out = attn_out.reshape(B, num_a_blocks, self.block_size_a, Da)
         attn_out = attn_out.reshape(B, Ta_pad, Da)
         attn_out = attn_out[:, :Ta, :]
@@ -258,9 +297,16 @@ class BlockRoutedCrossAttention(nn.Module):
         if not return_aux:
             return attn_out
 
+        routing_entropy = -(route_weights * route_weights.clamp_min(1e-8).log()).sum(dim=-1).mean()
         aux = {
             "routing_scores": routing_scores,
+            "routing_scores_masked": routing_scores_masked,
             "topk_indices": topk_indices,
+            "topk_values": topk_values,
+            "route_weights": route_weights,
+            "routing_entropy": routing_entropy,
+            "context_block_valid": context_block_valid,
+            "selected_token_valid": selected_token_valid,
             "num_a_blocks": num_a_blocks,
             "num_c_blocks": num_c_blocks,
             "pad_a": pad_a,
@@ -300,7 +346,7 @@ class ActionBlockAggregation(nn.Module):
 
         # gamma_b in R^{Sa x 1}, one gamma per token position in each block
         # shape: [1, Nb, Sa, 1]
-        self.gamma = nn.Parameter(torch.zeros(1, self.num_blocks, self.block_size_a, 1))
+        self.gamma = nn.Parameter(torch.full((1, self.num_blocks, self.block_size_a, 1), 0.01))
 
     def forward(self, action_tokens: torch.Tensor, return_aux: bool = False):
         """
@@ -329,11 +375,10 @@ class ActionBlockAggregation(nn.Module):
             summaries_norm, summaries_norm, summaries_norm, need_weights=False
         )
         summary_delta = self.summary_dropout(summary_delta)
-        block_summaries_hat = block_summaries + summary_delta
-            
+
         # inject back to each block
-        injected_summary = self.gamma * block_summaries_hat.unsqueeze(2)  # [B, Nb, Sa, Da]
-        aggregated_blocks = action_blocks + injected_summary               # [B, Nb, Sa, Da]
+        injected_summary = self.gamma * summary_delta.unsqueeze(2)  # [B, Nb, Sa, Da]
+        aggregated_blocks = action_blocks + injected_summary        # [B, Nb, Sa, Da]
 
         aggregated_action_tokens = aggregated_blocks.reshape(B, Ta, Da)
 
@@ -341,9 +386,9 @@ class ActionBlockAggregation(nn.Module):
             return aggregated_action_tokens
 
         aux = {
-            "block_summaries": block_summaries,         # [B, Nb, Da]
-            "block_summaries_hat": block_summaries_hat, # [B, Nb, Da]
-            "gamma": self.gamma,                        # [1, Nb, Sa, 1]
+            "block_summaries": block_summaries,  # [B, Nb, Da]
+            "summary_delta": summary_delta,      # [B, Nb, Da]
+            "gamma": self.gamma,                 # [1, Nb, Sa, 1]
         }
         return aggregated_action_tokens, aux
 
@@ -420,25 +465,30 @@ class BlockRoutedTransformerBlock(nn.Module):
         context_tokens: torch.Tensor,
         time_emb: torch.Tensor,
         return_aux: bool = False,
+        has_state_token: bool = False,
     ):
         # route attention
         x_norm = self.norm1(action_tokens)
 
         if return_aux:
-            attn_out, aux = self.routed_attn(x_norm, context_tokens, return_aux=True)
+            attn_out, aux = self.routed_attn(
+                x_norm, context_tokens, return_aux=True, has_state_token=has_state_token
+            )
         else:
-            attn_out = self.routed_attn(x_norm, context_tokens, return_aux=False)
+            attn_out = self.routed_attn(
+                x_norm, context_tokens, return_aux=False, has_state_token=has_state_token
+            )
             aux = None
         
-        # aggrate attention
-        if return_aux:
-            attn_out, agg_aux = self.action_block_agg(attn_out, return_aux=True)
-        else:
-            attn_out = self.action_block_agg(attn_out, return_aux=False)
-            agg_aux = None
-        
         x = action_tokens + attn_out
-        
+
+        # aggrate action representation
+        if return_aux:
+            x, agg_aux = self.action_block_agg(x, return_aux=True)
+            aux["aggregation"] = agg_aux
+        else:
+            x = self.action_block_agg(x, return_aux=False)
+
         # FFN
         x2 = self.norm2(x)
         if time_emb is not None:
@@ -545,29 +595,35 @@ class BlockBottleneckActionHead(nn.Module):
                 per_action_dim = action_dim // horizon if action_dim % horizon == 0 else action_dim
             self.action_encoder = MultiEmbodimentActionEncoder(action_dim=per_action_dim,
                                                                embed_dim=embed_dim,
-                                                               hidden_dim=embed_dim,  
+                                                               hidden_dim=embed_dim,
                                                                horizon=horizon,
                                                                num_categories=num_categories)
+
+    def _build_context_tokens(self, fused_tokens: torch.Tensor, state: torch.Tensor = None,
+                              embodiment_id: torch.LongTensor = None):
+        context_tokens = fused_tokens
+        has_state_token = False
+        if state is not None and self.state_encoder is not None:
+            state_emb = self.state_encoder(state, embodiment_id).unsqueeze(1)
+            context_tokens = torch.cat([context_tokens, state_emb], dim=1)
+            has_state_token = True
+        return context_tokens, has_state_token
 
     def forward(self, fused_tokens: torch.Tensor, state: torch.Tensor = None,
                 actions_gt: torch.Tensor = None, embodiment_id: torch.LongTensor = None, 
                 state_mask: torch.Tensor = None, action_mask: torch.Tensor = None):
 
         if actions_gt is None:
-            return self.get_action(fused_tokens, state=state, embodiment_id=embodiment_id)
+            return self.get_action(fused_tokens, state=state, embodiment_id=embodiment_id, action_mask=action_mask)
         B = fused_tokens.size(0)
         device = fused_tokens.device
 
         if embodiment_id is None:
             embodiment_id = torch.zeros(B, dtype=torch.long, device=device)
 
-        context_tokens = fused_tokens 
-        if state is not None and self.state_encoder is not None:
-
-            state_emb = self.state_encoder(state, embodiment_id)  
-            state_emb = state_emb.unsqueeze(1) 
-
-            context_tokens = torch.cat([context_tokens, state_emb], dim=1) 
+        context_tokens, has_state_token = self._build_context_tokens(
+            fused_tokens, state=state, embodiment_id=embodiment_id
+        )
 
         t = torch.distributions.Beta(2, 2).sample((B,)).clamp(0.02, 0.98).to(device).to(dtype=self.dtype)
 
@@ -611,11 +667,11 @@ class BlockBottleneckActionHead(nn.Module):
                 self.single_action_proj = nn.Linear(self.per_action_dim, self.embed_dim).to(device)
             action_tokens = self.single_action_proj(action_intermediate_seq) 
 
-        x = action_tokens  
+        x = action_tokens
         for block in self.transformer_blocks:
-            x = block(x, context_tokens, time_emb)
+            x = block(x, context_tokens, time_emb, has_state_token=has_state_token)
 
-        x = self.norm_out(x)  
+        x = self.norm_out(x)
 
         if self.horizon > 1:
  
@@ -646,11 +702,9 @@ class BlockBottleneckActionHead(nn.Module):
         if embodiment_id is None:
             embodiment_id = torch.zeros(B, dtype=torch.long, device=device)
 
-        context_tokens = fused_tokens
-        if state is not None and self.state_encoder is not None:
-
-            state_emb = self.state_encoder(state, embodiment_id).unsqueeze(1) 
-            context_tokens = torch.cat([context_tokens, state_emb], dim=1)
+        context_tokens, has_state_token = self._build_context_tokens(
+            fused_tokens, state=state, embodiment_id=embodiment_id
+        )
 
         action_dim_total = getattr(self.config, "action_dim", None)
         if action_dim_total is None:
@@ -714,7 +768,7 @@ class BlockBottleneckActionHead(nn.Module):
 
             x = action_tokens
             for block in self.transformer_blocks:
-                x = block(x, context_tokens, time_emb)
+                x = block(x, context_tokens, time_emb, has_state_token=has_state_token)
             x = self.norm_out(x)
 
             if self.horizon > 1:

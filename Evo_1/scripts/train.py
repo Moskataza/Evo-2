@@ -193,25 +193,44 @@ def check_numerical_stability(step: int, **named_tensors) -> bool:
             return False
     return True
 
-def log_training_step(step, loss, total_norm, clipped_norm, scheduler, dataloader, accelerator):
+def collect_blockbottleneck_grad_norms(model):
+    grad_groups = {
+        "action_route_proj": [],
+        "cond_route_proj": [],
+        "summary_attn": [],
+        "gamma": [],
+    }
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        for key in grad_groups:
+            if key in name:
+                grad_groups[key].append(param.grad.detach().float().norm())
+
+    grad_norms = {}
+    for key, norms in grad_groups.items():
+        if norms:
+            grad_norms[f"grad/{key}_norm"] = torch.norm(torch.stack(norms), 2).item()
+    return grad_norms
+
+
+def log_training_step(step, loss, total_norm, clipped_norm, scheduler, dataloader, accelerator, grad_norms=None):
     current_epoch = step / len(dataloader)
     if accelerator is None or accelerator.is_main_process:
+        grad_norms = grad_norms or {}
         logging.info(f"Estimated Epoch: {current_epoch:.2f}")
         logging.info(f"[Step {step}] Loss: {loss.item():.4f}")
-        wandb.log({
+        for name, value in grad_norms.items():
+            logging.info(f"[Step {step}] {name}: {value:.6f}")
+        metrics = {
             "step": step,
             "loss": loss.item(),
             "current_epoch": current_epoch,
             "learning_rate": scheduler.get_last_lr()[0],
-            
-        })
-        swanlab.log({
-            "step": step,
-            "loss": loss.item(),
-            "current_epoch": current_epoch,
-            "learning_rate": scheduler.get_last_lr()[0],
-    
-        })
+            **grad_norms,
+        }
+        wandb.log(metrics)
+        swanlab.log(metrics)
 
 def _read_checkpoint_metadata(checkpoint_dir: str):
     checkpoint_meta_path = os.path.join(checkpoint_dir, "checkpoint.json")
@@ -519,7 +538,7 @@ def train(config):
 
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
 
-                pred_velocity, noise = model(fused_tokens, state=states, actions_gt=actions_gt, action_mask=action_mask)
+                pred_velocity, noise = model(fused_tokens, state=states, actions_gt=actions_gt, action_mask=action_mask, embodiment_ids=embodiment_ids)
                 
             target_velocity = (actions_gt - noise).view(actions_gt.shape[0], -1)
             
@@ -534,7 +553,8 @@ def train(config):
 
             action_mask = action_mask.view(action_mask.shape[0], -1).to(dtype=pred_velocity.dtype)
             pred_velocity_mask = pred_velocity * action_mask
-            loss = loss_fn(pred_velocity_mask, target_velocity)
+            target_velocity_mask = target_velocity * action_mask
+            loss = loss_fn(pred_velocity_mask, target_velocity_mask)
             scale_factor = action_mask.numel() / (action_mask.sum() + 1e-8)
             loss = loss * scale_factor
             
@@ -555,13 +575,14 @@ def train(config):
 
             # === Clip grad norm ===
             total_norm, clipped_norm = get_and_clip_grad_norm(accelerator, model, loss, max_norm)
+            grad_norms = collect_blockbottleneck_grad_norms(model) if step % log_interval == 0 else None
 
             optimizer.step()
             scheduler.step()
-            
+
             # === Logging ===
             if step % log_interval == 0:
-                log_training_step(step, loss, total_norm, clipped_norm, scheduler, dataloader, accelerator)
+                log_training_step(step, loss, total_norm, clipped_norm, scheduler, dataloader, accelerator, grad_norms=grad_norms)
    
             # === Save best checkpoint ===
             loss_value = loss.item()
