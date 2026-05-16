@@ -231,9 +231,7 @@ class BlockRoutedCrossAttention(nn.Module):
             ~context_block_valid.unsqueeze(1), torch.finfo(routing_scores.dtype).min
         )
 
-        topk_values, topk_indices = routing_scores_masked.topk(k=topk_eff, dim=-1)
-        route_weights = torch.softmax(topk_values, dim=-1)
-        route_log_bias = torch.log_softmax(topk_values, dim=-1)
+        topk_indices = routing_scores_masked.topk(k=topk_eff, dim=-1).indices
 
         context_blocks_flat = context_blocks.reshape(B * num_c_blocks, self.block_size_c, Dc)
         context_valid_flat = context_token_valid.reshape(B * num_c_blocks, self.block_size_c)
@@ -242,7 +240,6 @@ class BlockRoutedCrossAttention(nn.Module):
         selected_context_blocks = context_blocks_flat[flat_indices]
         selected_context_valid = context_valid_flat[flat_indices]
 
-        selected_context_blocks = selected_context_blocks * route_weights[..., None, None]
         selected_context_tokens = selected_context_blocks.reshape(
             B, num_a_blocks, topk_eff * self.block_size_c, Dc
         )
@@ -267,24 +264,10 @@ class BlockRoutedCrossAttention(nn.Module):
             ~selected_token_valid.reshape(B * num_a_blocks, -1), torch.finfo(key_padding_mask.dtype).min
         )
 
-        normal_bias = route_log_bias[..., None].expand(
-            B, num_a_blocks, topk_eff, self.block_size_c
-        ).reshape(B, num_a_blocks, topk_eff * self.block_size_c)
-        if state_token is not None:
-            state_bias = torch.zeros(B, num_a_blocks, 1, dtype=normal_bias.dtype, device=normal_bias.device)
-            attn_bias = torch.cat([normal_bias, state_bias], dim=-1)
-        else:
-            attn_bias = normal_bias
-        attn_bias = attn_bias.unsqueeze(2).expand(
-            B, num_a_blocks, self.block_size_a, attn_bias.size(-1)
-        ).reshape(B * num_a_blocks, self.block_size_a, -1)
-        attn_bias = attn_bias.repeat_interleave(self.num_heads, dim=0)
-
         attn_out, _ = self.cross_attn(
             query=action_blocks_flat,
             key=selected_context_flat,
             value=selected_context_flat,
-            attn_mask=attn_bias,
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )
@@ -297,14 +280,10 @@ class BlockRoutedCrossAttention(nn.Module):
         if not return_aux:
             return attn_out
 
-        routing_entropy = -(route_weights * route_weights.clamp_min(1e-8).log()).sum(dim=-1).mean()
         aux = {
             "routing_scores": routing_scores,
             "routing_scores_masked": routing_scores_masked,
             "topk_indices": topk_indices,
-            "topk_values": topk_values,
-            "route_weights": route_weights,
-            "routing_entropy": routing_entropy,
             "context_block_valid": context_block_valid,
             "selected_token_valid": selected_token_valid,
             "num_a_blocks": num_a_blocks,

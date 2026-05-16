@@ -1,0 +1,246 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\title{BlockBottleneck Action Head in EVO-1}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document describes the current implementation of the \texttt{BlockBottleneckActionHead} in EVO-1. The module keeps the original flow-matching action generation objective, but replaces dense token-level cross-attention with block-routed cross-attention and adds an action block aggregation module. The design aims to reduce redundant visual-language conditioning while preserving long-horizon action coordination.
+\end{abstract}
+
+\section{Overview}
+
+EVO-1 follows a vision-language-action formulation in which a vision-language model produces fused context tokens and an action expert predicts robot actions. Given visual-language tokens $C \in \mathbb{R}^{B \times T_c \times d}$, proprioceptive state $s$, and a target action sequence $x_1 \in \mathbb{R}^{B \times H \times d_a}$, the action head learns a flow-matching velocity field over the action trajectory.
+
+The original flow-matching action head uses dense cross-attention between every action token and every context token. In contrast, the current \texttt{blockbottleneck} implementation introduces two structural changes:
+\begin{enumerate}
+    \item \textbf{Block-routed cross-attention}: action tokens and context tokens are grouped into blocks. Each action block selects only the top-$k$ most relevant context blocks before cross-attention.
+    \item \textbf{Action block aggregation}: action block summaries interact through self-attention and inject an inter-block correction back into each action token.
+\end{enumerate}
+
+Thus, the implementation keeps the same training target as the flow-matching baseline, while changing the internal attention path from dense conditioning to routed block-level conditioning.
+
+\section{Flow-Matching Action Objective}
+
+Let $x_1$ denote the ground-truth action sequence and $\epsilon \sim \mathcal{N}(0,I)$ denote Gaussian noise with the same shape as $x_1$. For a sampled time $t \in [0,1]$, the noisy action input is constructed as
+\begin{equation}
+    x_t = (1-t)\epsilon + t x_1.
+\end{equation}
+The target velocity is
+\begin{equation}
+    v^* = x_1 - \epsilon.
+\end{equation}
+The action head predicts
+\begin{equation}
+    \hat{v} = v_\theta(x_t, C, s, t),
+\end{equation}
+where $C$ is the fused visual-language context and $s$ is the robot state. With an action validity mask $m$, the training loss is a masked mean-squared error:
+\begin{equation}
+    \mathcal{L}
+    =
+    \left\|
+    m \odot \hat{v}
+    -
+    m \odot v^*
+    \right\|_2^2.
+\end{equation}
+The current implementation masks both prediction and target velocity before computing the loss.
+
+\section{Context Token Construction}
+
+The action head first builds a context sequence by appending a state token to the fused vision-language tokens. If a state encoder is available, the state token is computed as
+\begin{equation}
+    c_s = f_s(s, e),
+\end{equation}
+where $e$ is the optional embodiment identifier. The final context sequence is
+\begin{equation}
+    \tilde{C} = [C; c_s].
+\end{equation}
+If state input is unavailable, the implementation appends a zero state slot with the same embedding dimension. This guarantees that the final token in the context sequence is always reserved for state conditioning, preventing the router from accidentally treating the last visual-language token as a state token.
+
+\section{Block-Routed Cross-Attention}
+
+\subsection{Block Partitioning}
+
+Let $A \in \mathbb{R}^{B \times T_a \times d}$ be the action token sequence after action embedding, time embedding, and optional category embedding. The method partitions action tokens into blocks of size $b_a$:
+\begin{equation}
+    A \rightarrow \{A_i\}_{i=1}^{N_a},
+    \qquad
+    A_i \in \mathbb{R}^{b_a \times d}.
+\end{equation}
+The normal context tokens, excluding the final state token, are partitioned into blocks of size $b_c$:
+\begin{equation}
+    C \rightarrow \{C_j\}_{j=1}^{N_c},
+    \qquad
+    C_j \in \mathbb{R}^{b_c \times d}.
+\end{equation}
+If the sequence length is not divisible by the block size, the implementation pads the sequence and records a validity mask. Context block summaries are computed by masked mean pooling, so padded tokens do not dilute the route representation.
+
+\subsection{Route Score Computation}
+
+For each action block and context block, the implementation computes block summaries:
+\begin{equation}
+    \bar{A}_i = \frac{1}{b_a}\sum_{p=1}^{b_a} A_{i,p},
+\end{equation}
+\begin{equation}
+    \bar{C}_j =
+    \frac{\sum_{q=1}^{b_c} M_{j,q} C_{j,q}}
+    {\sum_{q=1}^{b_c} M_{j,q}},
+\end{equation}
+where $M_{j,q}$ is the context token validity mask.
+
+The summaries are projected into a routing space:
+\begin{equation}
+    r^A_i = W_A \bar{A}_i,
+    \qquad
+    r^C_j = W_C \bar{C}_j.
+\end{equation}
+The routing score between action block $i$ and context block $j$ is
+\begin{equation}
+    s_{ij}
+    =
+    \frac{(r^A_i)^\top r^C_j}{\sqrt{d_r}},
+\end{equation}
+where $d_r$ is the routing dimension. Invalid context blocks are masked before top-$k$ selection.
+
+\subsection{Top-$k$ Context Block Selection}
+
+For each action block $i$, the router selects the top-$k$ context blocks:
+\begin{equation}
+    \mathcal{S}_i = \operatorname{TopK}_j(s_{ij}).
+\end{equation}
+The indices $\mathcal{S}_i$ determine which context blocks are gathered for local cross-attention. The index selection is discrete and non-differentiable; after the top-$k$ blocks are selected, the routing scores are not used as continuous weights in the attention computation.
+
+\subsection{Discrete Block-Routed Cross-Attention}
+
+For each action block, the selected context blocks are concatenated with the state token. For action queries $Q_i$, selected keys $K_i$, and selected values $V_i$, the routed cross-attention is
+\begin{equation}
+    \operatorname{RoutedAttn}(Q_i,K_i,V_i)
+    =
+    \operatorname{Softmax}
+    \left(
+    \frac{Q_i K_i^\top}{\sqrt{d}}
+    +
+    \mathcal{M}_i
+    \right)V_i,
+\end{equation}
+where $\mathcal{M}_i$ is the additive mask for invalid padded tokens. The state token is always included as a valid conditioning token.
+
+This design preserves the computational bottleneck of hard top-$k$ routing and keeps routing as a discrete block-selection mechanism rather than a differentiable route-weighted attention path.
+
+\section{Block-Routed Transformer Block}
+
+Each transformer block in the \texttt{BlockBottleneckActionHead} follows the same high-level residual structure as the original flow-matching action head, but replaces full cross-attention with routed cross-attention and inserts action block aggregation after the attention residual.
+
+Given input action tokens $A$, context tokens $\tilde{C}$, and time embedding $\tau$, the block computes
+\begin{align}
+    U &= \operatorname{RoutedCrossAttn}(\operatorname{LN}(A), \tilde{C}), \\
+    X &= A + U, \\
+    X' &= \operatorname{ActionBlockAggregation}(X), \\
+    Y &= X' + \operatorname{FFN}(\operatorname{LN}(X') + \tau).
+\end{align}
+Applying aggregation after the residual means that the aggregation module receives the complete action representation rather than only the routed-attention delta.
+
+\section{Action Block Aggregation}
+
+\subsection{Block Summary Interaction}
+
+After routed cross-attention, the action sequence is again viewed as action blocks. For each block, a summary token is computed by mean pooling:
+\begin{equation}
+    z_i = \frac{1}{b_a}\sum_{p=1}^{b_a} X_{i,p}.
+\end{equation}
+The block summaries interact through self-attention:
+\begin{equation}
+    \Delta = \operatorname{SelfAttn}(\operatorname{LN}(Z)),
+\end{equation}
+where $Z = [z_1,\ldots,z_{N_a}]$. The resulting summary delta $\Delta_i$ represents inter-block action coordination information.
+
+\subsection{Learnable Summary Injection}
+
+The summary delta is injected back into each token of the corresponding action block:
+\begin{equation}
+    X'_{i,p} = X_{i,p} + \gamma_{i,p}\Delta_i.
+\end{equation}
+Here $\gamma$ is a learnable parameter with shape compatible with action blocks. In the current implementation, $\gamma$ is initialized to a small nonzero value, $0.01$, rather than zero. This allows the summary-attention module to receive gradients from the first backward pass while keeping the initial perturbation small.
+
+The aggregation injects only the summary delta, not the original block summary plus the delta. This avoids repeatedly adding the block mean back into every token.
+
+\section{Inference}
+
+At inference time, the model starts from Gaussian noise in action space and iteratively integrates the learned velocity field. For each denoising step, the same block-routed transformer stack predicts the velocity conditioned on fused visual-language tokens, state tokens, and time embeddings. After the final step, the flat action vector is reshaped into a horizon-length action sequence.
+
+\section{Algorithm}
+
+\begin{algorithm}[t]
+\caption{BlockBottleneck Action Head Forward Pass}
+\label{alg:blockbottleneck}
+\begin{algorithmic}[1]
+\Require Fused tokens $C$, state $s$, noisy action $x_t$, time $t$, optional embodiment id $e$
+\Ensure Predicted velocity $\hat{v}$
+\State Append encoded state token to context: $\tilde{C} \gets [C; f_s(s,e)]$
+\State Embed noisy action sequence into action tokens: $A \gets f_a(x_t)$
+\State Add time embedding and optional category embedding to $A$
+\For{each block-routed transformer layer}
+    \State Partition action tokens into blocks $\{A_i\}_{i=1}^{N_a}$
+    \State Partition non-state context tokens into blocks $\{C_j\}_{j=1}^{N_c}$
+    \State Compute action block summaries $\bar{A}_i$ and masked context block summaries $\bar{C}_j$
+    \State Compute routing scores $s_{ij} = (W_A\bar{A}_i)^\top(W_C\bar{C}_j)/\sqrt{d_r}$
+    \State Select top-$k$ context blocks $\mathcal{S}_i$ for each action block
+    \State Apply local cross-attention using selected context blocks and padding masks
+    \State Add routed-attention residual to action tokens
+    \State Apply action block aggregation by self-attending over block summaries and injecting $\gamma\Delta_i$
+    \State Apply feed-forward residual block
+\EndFor
+\State Project final action tokens to velocity prediction $\hat{v}$
+\State \Return $\hat{v}$
+\end{algorithmic}
+\end{algorithm}
+
+\section{Implementation Notes}
+
+\begin{itemize}
+    \item The routing operation keeps hard top-$k$ indices for efficient block selection.
+    \item The selected top-$k$ scores are used only to choose block indices; they are not applied as route weights or attention biases.
+    \item Context padding is handled by both masked block pooling and additive key padding masks inside cross-attention.
+    \item The state token is always appended as the final context token and is always valid.
+    \item The aggregation parameter $\gamma$ keeps the same state-dict key and shape as before, preserving checkpoint compatibility while changing fresh initialization to a small nonzero value.
+    \item Training diagnostics log gradient norms for route projections, summary attention, and $\gamma$, making it possible to verify that the new modules receive gradients.
+\end{itemize}
+
+\section{Relation to the Original Flow-Matching Head}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+Component & Flow-Matching Head & BlockBottleneck Head \\
+\midrule
+Training target & Flow velocity $x_1 - \epsilon$ & Same \\
+Action input & Noisy action $x_t$ & Same \\
+Condition tokens & Full visual-language context & Context plus explicit state slot \\
+Cross-attention & Dense token-level attention & Top-$k$ block-routed attention \\
+Routing weights & Not used & Not used after discrete top-$k$ selection \\
+Inter-block action modeling & Implicit through transformer layers & Explicit action block aggregation \\
+Loss & Masked velocity MSE & Masked velocity MSE \\
+\bottomrule
+\end{tabular}
+\caption{Comparison between the original flow-matching action head and the current BlockBottleneck implementation.}
+\label{tab:flowmatching_blockbottleneck}
+\end{table}
+
+\section{Summary}
+
+The current \texttt{blockbottleneck} implementation can be summarized as follows: it preserves the original EVO-1 flow-matching action generation framework, but replaces dense context conditioning with a block-level routed bottleneck. Action blocks first select a small number of relevant context blocks through discrete top-$k$ routing. The selected context blocks are then used directly in local cross-attention, without route-weighted value gating or additive route bias. Finally, action block aggregation performs self-attention over action block summaries and injects a learnable inter-block correction back into the action tokens. This produces a lightweight action expert that is structurally aligned with the intended research design while retaining the original flow-matching training objective.
+
+\end{document}
