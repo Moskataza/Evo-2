@@ -322,22 +322,48 @@ If you are training on multiple GPUs, set `--num_processes` to the number of GPU
 
 Stage 1 trains the integration module and action expert.
 
+##### 5.1.1 Flowmatching
+
 ```bash
 conda activate Evo1
 cd /home/kataz/project/Evo-1/Evo_1
 
-accelerate launch --num_processes 1 --num_machines 1 --deepspeed_config_file ds_config.json scripts/train.py --run_name Evo1_metaworld_stage1 --action_head flowmatching --use_augmentation --lr 1e-5 --dropout 0.2 --weight_decay 1e-3 --batch_size 16 --image_size 448 --max_steps 5000 --log_interval 10 --ckpt_interval 2500 --warmup_steps 1000 --grad_clip_norm 1.0 --num_layers 8 --horizon 50 --finetune_action_head --disable_wandb --vlm_name OpenGVLab/InternVL3-1B --dataset_config_path dataset/config.yaml --per_action_dim 24 --state_dim 24 --save_dir /your/path/checkpoints/stage1
+accelerate launch --num_processes 1 --num_machines 1 --deepspeed_config_file ds_config.json scripts/train.py --run_name Evo1_metaworld_stage1_flowmatching --action_head flowmatching --use_augmentation --lr 1e-5 --dropout 0.2 --weight_decay 1e-3 --batch_size 16 --image_size 448 --max_steps 5000 --log_interval 10 --ckpt_interval 2500 --warmup_steps 1000 --grad_clip_norm 1.0 --num_layers 8 --horizon 50 --finetune_action_head --disable_wandb --vlm_name OpenGVLab/InternVL3-1B --dataset_config_path dataset/config.yaml --per_action_dim 24 --state_dim 24 --save_dir /your/path/checkpoints/stage1_flowmatching
+```
+
+##### 5.1.2 BlockBottleneck
+
+`blockbottleneck` supports three extra routing parameters. Their defaults are `--block_size_a 5`, `--block_size_c 32`, and `--topk 4`. For `--horizon 50`, valid `block_size_a` values must divide 50, such as `1`, `2`, `5`, `10`, `25`, or `50`.
+
+```bash
+conda activate Evo1
+cd /home/kataz/project/Evo-1/Evo_1
+
+accelerate launch --num_processes 1 --num_machines 1 --deepspeed_config_file ds_config.json scripts/train.py --run_name Evo1_metaworld_stage1_blockbottleneck --action_head blockbottleneck --block_size_a 5 --block_size_c 32 --topk 4 --use_augmentation --lr 1e-5 --dropout 0.2 --weight_decay 1e-3 --batch_size 16 --image_size 448 --max_steps 5000 --log_interval 10 --ckpt_interval 2500 --warmup_steps 1000 --grad_clip_norm 1.0 --num_layers 8 --horizon 50 --finetune_action_head --disable_wandb --vlm_name OpenGVLab/InternVL3-1B --dataset_config_path dataset/config.yaml --per_action_dim 24 --state_dim 24 --save_dir /your/path/checkpoints/stage1_blockbottleneck
 ```
 
 #### 5.2 Stage 2
 
 Stage 2 performs full-scale training and resumes from the Stage 1 checkpoint.
 
+##### 5.2.1 Flowmatching
+
 ```bash
 conda activate Evo1
 cd /home/kataz/project/Evo-1/Evo_1
 
-accelerate launch --num_processes 1 --num_machines 1 --deepspeed_config_file ds_config.json scripts/train.py --run_name Evo1_metaworld_stage2 --action_head flowmatching --use_augmentation --lr 1e-5 --dropout 0.2 --weight_decay 1e-3 --batch_size 16 --image_size 448 --max_steps 80000 --log_interval 10 --ckpt_interval 2500 --warmup_steps 1000 --grad_clip_norm 1.0 --num_layers 8 --horizon 50 --finetune_vlm --finetune_action_head --disable_wandb --vlm_name OpenGVLab/InternVL3-1B --dataset_config_path dataset/config.yaml --per_action_dim 24 --state_dim 24 --save_dir /your/path/checkpoints/stage2 --resume --resume_pretrain --resume_path /your/path/checkpoints/stage1/step_5000
+accelerate launch --num_processes 1 --num_machines 1 --deepspeed_config_file ds_config.json scripts/train.py --run_name Evo1_metaworld_stage2_flowmatching --action_head flowmatching --use_augmentation --lr 1e-5 --dropout 0.2 --weight_decay 1e-3 --batch_size 16 --image_size 448 --max_steps 80000 --log_interval 10 --ckpt_interval 2500 --warmup_steps 1000 --grad_clip_norm 1.0 --num_layers 8 --horizon 50 --finetune_vlm --finetune_action_head --disable_wandb --vlm_name OpenGVLab/InternVL3-1B --dataset_config_path dataset/config.yaml --per_action_dim 24 --state_dim 24 --save_dir /your/path/checkpoints/stage2_flowmatching --resume --resume_pretrain --resume_path /your/path/checkpoints/stage1_flowmatching/step_5000
+```
+
+##### 5.2.2 BlockBottleneck
+
+Use the same `block_size_a`, `block_size_c`, and `topk` values as Stage 1 when resuming from a BlockBottleneck checkpoint.
+
+```bash
+conda activate Evo1
+cd /home/kataz/project/Evo-1/Evo_1
+
+accelerate launch --num_processes 1 --num_machines 1 --deepspeed_config_file ds_config.json scripts/train.py --run_name Evo1_metaworld_stage2_blockbottleneck --action_head blockbottleneck --block_size_a 5 --block_size_c 32 --topk 4 --use_augmentation --lr 1e-5 --dropout 0.2 --weight_decay 1e-3 --batch_size 16 --image_size 448 --max_steps 80000 --log_interval 10 --ckpt_interval 2500 --warmup_steps 1000 --grad_clip_norm 1.0 --num_layers 8 --horizon 50 --finetune_vlm --finetune_action_head --disable_wandb --vlm_name OpenGVLab/InternVL3-1B --dataset_config_path dataset/config.yaml --per_action_dim 24 --state_dim 24 --save_dir /your/path/checkpoints/stage2_blockbottleneck --resume --resume_pretrain --resume_path /your/path/checkpoints/stage1_blockbottleneck/step_5000
 ```
 
 #### 5.3 Resume training from a saved checkpoint
